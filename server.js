@@ -49,15 +49,34 @@ function textOrNull($el) {
 }
 
 function extractImages($) {
+  const images = [];
+
+  // 1️⃣ OpenGraph hoofdafbeelding
   const og = $('meta[property="og:image"]').attr("content");
-  const imgs = [];
-  if (og) imgs.push(og);
+  if (og) images.push(og);
+
+  // 2️⃣ Zoek alleen afbeeldingen die op lot-images lijken
   $("img").each((_, img) => {
     const $img = $(img);
-    const src = $img.attr("src") || $img.attr("data-src") || $img.attr("data-lazy-src");
-    if (src && /^https?:\/\//i.test(src)) imgs.push(src);
+    const src =
+      $img.attr("src") ||
+      $img.attr("data-src") ||
+      $img.attr("data-lazy-src");
+
+    if (!src) return;
+
+    // Filter op typische lot-image patronen
+    if (
+      src.includes("/image/") ||
+      src.includes("/lot/") ||
+      src.includes("media.catawiki")
+    ) {
+      images.push(src);
+    }
   });
-  return uniq(imgs);
+
+  // Uniek maken
+  return [...new Set(images)];
 }
 
 function bestEffortParse($) {
