@@ -2,7 +2,6 @@
 // Catawiki lot reader (best-effort) with:
 // - Bearer token auth (API_KEY env var)
 // - Image filtering to avoid expert/avatar/UI images
-// - Improved image extraction (img/srcset/source + raw HTML scan)
 //
 // Note: Shipping extraction removed (unreliable). Shipping is returned as { currency: null, costs: [] }.
 
@@ -45,10 +44,7 @@ app.use((req, res, next) => {
 function isLikelyCatawikiLotUrl(url) {
   try {
     const u = new URL(url);
-    return (
-      /catawiki\./i.test(u.hostname) &&
-      /\/l\/|\/lot\/|\/lots\//i.test(u.pathname)
-    );
+    return /catawiki\./i.test(u.hostname) && /\/l\/|\/lot\/|\/lots\//i.test(u.pathname);
   } catch {
     return false;
   }
@@ -98,6 +94,11 @@ function looksLikeLotImageUrl(url) {
   if (!/^https?:\/\//i.test(lower)) return false;
   if (lower.endsWith(".svg")) return false;
 
+  // Positive signals
+  const positive =
+    lower.includes("media.catawiki") ||
+    (lower.includes("catawiki") && (lower.includes("/image/") || lower.includes("/lot/")));
+
   // Negative signals
   const negative =
     lower.includes("avatar") ||
@@ -108,43 +109,7 @@ function looksLikeLotImageUrl(url) {
     lower.includes("payment") ||
     lower.includes("badge");
 
-  if (negative) return false;
-
-  // Positive signals (broader than before)
-  // Catawiki lot images commonly appear on assets/media/images.*
-  const positive =
-    lower.includes("assets.catawiki") ||
-    lower.includes("media.catawiki") ||
-    lower.includes("images.catawiki") ||
-    lower.includes("catawiki.");
-
-  return positive;
-}
-
-function extractUrlsFromSrcset(srcset) {
-  if (!srcset) return [];
-  // "url1 320w, url2 640w" -> ["url1", "url2"]
-  return String(srcset)
-    .split(",")
-    .map((s) => s.trim().split(/\s+/)[0])
-    .filter(Boolean);
-}
-
-function extractImagesFromRawHtml(html) {
-  // Some lot gallery URLs are embedded in scripts/data and not present as <img>.
-  // Best-effort: scan the raw HTML for known CDN image URLs.
-  const out = [];
-  if (!html) return out;
-
-  // Matches e.g. https://assets.catawiki.com/image/...jpg@webp
-  const re =
-    /https?:\/\/assets\.catawiki\.com\/image\/[^"'\\\s]+?\.(?:jpg|jpeg|png)(?:%40webp|@webp)?/gi;
-
-  const hits = html.match(re) || [];
-  for (const u of hits) {
-    if (looksLikeLotImageUrl(u)) out.push(u);
-  }
-  return uniq(out);
+  return positive && !negative;
 }
 
 function extractImages($) {
@@ -157,31 +122,10 @@ function extractImages($) {
   // Collect images that look like lot media
   $("img").each((_, img) => {
     const $img = $(img);
+    const src =
+      $img.attr("src") || $img.attr("data-src") || $img.attr("data-lazy-src");
 
-    const candidates = [
-      $img.attr("src"),
-      $img.attr("data-src"),
-      $img.attr("data-lazy-src"),
-      ...extractUrlsFromSrcset($img.attr("srcset")),
-      ...extractUrlsFromSrcset($img.attr("data-srcset")),
-    ];
-
-    for (const u of candidates) {
-      if (looksLikeLotImageUrl(u)) images.push(u);
-    }
-  });
-
-  // <picture><source srcset=...>
-  $("source").each((_, s) => {
-    const $s = $(s);
-    const candidates = [
-      ...extractUrlsFromSrcset($s.attr("srcset")),
-      ...extractUrlsFromSrcset($s.attr("data-srcset")),
-    ];
-
-    for (const u of candidates) {
-      if (looksLikeLotImageUrl(u)) images.push(u);
-    }
+    if (looksLikeLotImageUrl(src)) images.push(src);
   });
 
   return uniq(images);
@@ -293,17 +237,6 @@ app.post("/v1/catawiki/lot", async (req, res) => {
     const html = await r.text();
     const $ = cheerio.load(html);
     const parsed = bestEffortParse($);
-
-    // Extra: scan raw HTML for image URLs embedded in scripts/data
-    const rawImages = extractImagesFromRawHtml(html);
-
-    const mergedImages = uniq([...(parsed.image_urls || []), ...rawImages]);
-    parsed.image_urls = mergedImages;
-
-    // Optional warning if still low
-    if (parsed.image_urls.length < 6) {
-      parsed.warnings = uniq([...(parsed.warnings || []), "Only a few images found; gallery may be JS-loaded."]);
-    }
 
     return res.json({
       ok: true,
