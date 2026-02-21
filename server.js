@@ -1,8 +1,9 @@
 // server.js
 // Catawiki lot reader (best-effort) with:
 // - Bearer token auth (API_KEY env var)
-// - Robust-ish shipping extraction (handles lines like "€ 17 vanuit Italië, levertijd 6–12 dagen")
-// - Image filtering to avoid expert/avatar/UI images
+// - Better shipping extraction using BOTH rendered body text and HTML-derived lines
+// - Lot-image filtering (avoids expert/avatar/UI images)
+// - Optional debug output (set DEBUG=1)
 
 import express from "express";
 import fetch from "node-fetch";
@@ -15,6 +16,7 @@ app.use(express.json({ limit: "1mb" }));
 // Auth (Bearer token)
 // =====================
 const API_KEY = process.env.API_KEY;
+const DEBUG = process.env.DEBUG === "1";
 
 app.use((req, res, next) => {
   const auth = req.headers.authorization || "";
@@ -63,7 +65,6 @@ function parseMoney(text) {
   if (!text) return { currency: null, amount: null, amount_text: null };
   const t = text.replace(/\s+/g, " ").trim();
 
-  // Support €, $, £
   const m = t.match(/(€|\$|£)\s?([\d.,]+)/);
   if (!m) return { currency: null, amount: null, amount_text: t };
 
@@ -84,30 +85,32 @@ function parseMoney(text) {
   };
 }
 
-// Prefer only "lot-like" images, not avatars/icons.
+// =====================
+// Image extraction (filter out expert/profile/UI images)
+// =====================
 function looksLikeLotImageUrl(url) {
   if (!url) return false;
-  const u = url.toLowerCase();
-
-  // Common Catawiki media domains/patterns; keep broad but avoid svg/icons
   const isHttp = /^https?:\/\//i.test(url);
   if (!isHttp) return false;
+
+  const u = url.toLowerCase();
   if (u.endsWith(".svg")) return false;
 
-  // Positive signals
+  // Positive signals (keep broad)
   const positive =
     u.includes("media.catawiki") ||
-    u.includes("catawiki") && (u.includes("/image/") || u.includes("/lot/"));
+    (u.includes("catawiki") && (u.includes("/image/") || u.includes("/lot/")));
 
-  // Negative signals (avatars, icons, logos)
+  // Negative signals (avatars, icons, logos etc.)
   const negative =
     u.includes("avatar") ||
     u.includes("profile") ||
     u.includes("icon") ||
     u.includes("logo") ||
-    u.includes("trustpilot") ||
+    u.includes("badge") ||
     u.includes("payment") ||
-    u.includes("badge");
+    u.includes("trustpilot") ||
+    u.includes("expert");
 
   return positive && !negative;
 }
@@ -119,7 +122,6 @@ function extractImages($) {
   const og = $('meta[property="og:image"]').attr("content");
   if (looksLikeLotImageUrl(og)) images.push(og);
 
-  // Collect images that look like lot media
   $("img").each((_, img) => {
     const $img = $(img);
     const src =
@@ -130,60 +132,64 @@ function extractImages($) {
   return uniq(images);
 }
 
-/**
- * Robust-ish shipping extraction that can catch:
- * "€ 17 vanuit Italië, levertijd 6–12 dagen"
- * It searches line-by-line for:
- * - a € amount
- * - and shipping context words near it
- *
- * Note: It’s still best-effort and does NOT guess if nothing matches.
- */
-function extractShippingFromText(bodyTextRaw) {
-  const bodyText = (bodyTextRaw || "")
-    .replace(/\u00a0/g, " ") // NBSP
-    .replace(/\s+/g, " ")
-    .trim();
+// =====================
+// Shipping extraction (better)
+// =====================
+function htmlToTextLines(html) {
+  // Convert HTML into line-ish text to preserve some block boundaries
+  return (html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<\/(div|p|li|br|tr|td|th|section|article|h\d)>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\u00a0/g, " ");
+}
 
-  if (!bodyText) {
-    return { currency: null, costs: [], warning: "Empty body text" };
-  }
-
-  // Try to preserve “line-like” separators by also splitting on common punctuation boundaries.
-  // We do a simple split to get smaller chunks, increasing match chances.
-  const chunks = uniq(
-    bodyText
-      .split(/[\n\r]+|•|\|/g)
-      .map((s) => s.trim())
-      .filter(Boolean)
-  );
-
+function extractShippingBestEffort(html, bodyTextRaw) {
+  // Context words that often appear near shipping in NL/EN
   const ctxRe =
-    /(\bverzend|\bverzending\b|\bbezorg|\blevertijd\b|\bdagen\b|\bvanuit\b|\bshipping\b|\bdelivery\b|\bdays\b|\bfrom\b)/i;
+    /(\bvanuit\b|\blevertijd\b|\bdagen\b|\bbezorg\b|\bverzend|\bverzending\b|\bshipping\b|\bdelivery\b|\bdays\b|\bfrom\b)/i;
+
+  // Two sources:
+  // - raw body text (cheerio text)
+  // - HTML-derived "line text" (often keeps more structure)
+  const srcs = [
+    (bodyTextRaw || "").replace(/\u00a0/g, " "),
+    htmlToTextLines(html),
+  ];
 
   const candidates = [];
 
-  for (const chunk of chunks) {
-    const moneyMatch = chunk.match(/€\s?[\d.,]+/);
-    if (!moneyMatch) continue;
+  for (const src of srcs) {
+    const lines = src
+      .split(/\n+/)
+      .map((l) => l.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
 
-    // must have some shipping-ish context in same chunk
-    if (!ctxRe.test(chunk)) continue;
+    for (const line of lines) {
+      // must contain a € amount
+      const moneyMatch = line.match(/€\s?[\d.,]+/);
+      if (!moneyMatch) continue;
 
-    const pm = parseMoney(moneyMatch[0]);
-    if (pm.currency !== "EUR" || pm.amount == null) continue;
+      // must contain shipping-ish context
+      if (!ctxRe.test(line)) continue;
 
-    candidates.push({
-      destination: chunk,
-      amount: pm.amount,
-      amount_text: pm.amount_text,
-    });
+      const pm = parseMoney(moneyMatch[0]);
+      if (pm.currency === "EUR" && pm.amount != null) {
+        candidates.push({
+          destination: line,
+          amount: pm.amount,
+          amount_text: pm.amount_text,
+        });
+      }
+    }
   }
 
+  // If still nothing, do a fallback "window" scan on the whole HTML-derived text:
   if (candidates.length === 0) {
-    // Fallback: scan the entire text for a pattern "... €xx ... vanuit/levertijd ..."
-    const fallback = bodyText.match(
-      /(€\s?[\d.,]+).{0,80}(\bvanuit\b|\blevertijd\b|\bdagen\b|\bverzend|\bshipping\b|\bdelivery\b|\bfrom\b)/i
+    const big = htmlToTextLines(html).replace(/\s+/g, " ").trim();
+    const fallback = big.match(
+      /(€\s?[\d.,]+).{0,120}(\bvanuit\b|\blevertijd\b|\bdagen\b|\bverzend|\bshipping\b|\bdelivery\b|\bfrom\b)/i
     );
     if (fallback) {
       const pm = parseMoney(fallback[1]);
@@ -197,15 +203,22 @@ function extractShippingFromText(bodyTextRaw) {
               amount_text: pm.amount_text,
             },
           ],
-          warning: "Shipping detected via fallback pattern; verify against UI if critical.",
+          warning:
+            "Shipping detected via fallback pattern; verify if multiple destinations exist.",
+          debug_candidates: DEBUG ? [] : undefined,
         };
       }
     }
 
-    return { currency: null, costs: [], warning: "Shipping not detected" };
+    return {
+      currency: null,
+      costs: [],
+      warning: "Shipping not detected",
+      debug_candidates: DEBUG ? [] : undefined,
+    };
   }
 
-  // If multiple candidates, choose lowest conservatively and warn.
+  // Choose lowest amount conservatively if multiple matches
   candidates.sort((a, b) => a.amount - b.amount);
   const chosen = candidates[0];
 
@@ -216,10 +229,14 @@ function extractShippingFromText(bodyTextRaw) {
       candidates.length > 1
         ? "Multiple shipping-like lines found; chose lowest amount conservatively."
         : null,
+    debug_candidates: DEBUG ? candidates.slice(0, 8) : undefined,
   };
 }
 
-function bestEffortParse($) {
+// =====================
+// Main parse
+// =====================
+function bestEffortParse($, html) {
   const title =
     textOrNull($("h1")) ||
     $('meta[property="og:title"]').attr("content")?.trim() ||
@@ -238,19 +255,19 @@ function bestEffortParse($) {
     null;
 
   const bodyTextRaw = $("body").text();
-
-  // Current bid (best-effort, keyword based)
   const bodyFlat = (bodyTextRaw || "").replace(/\s+/g, " ").trim();
+
+  // Current bid (keyword-based)
   const currentBidMatch = bodyFlat.match(
-    /(Current bid|Huidig bod|Bid now|Bied nu).{0,120}(€\s?[\d.,]+)/i
+    /(Current bid|Huidig bod|Bid now|Bied nu).{0,160}(€\s?[\d.,]+)/i
   );
   const current_bid = currentBidMatch
     ? parseMoney(currentBidMatch[2])
     : { currency: null, amount: null, amount_text: null };
 
-  // Estimate (best-effort)
+  // Estimate (keyword-based)
   const estimateMatch = bodyFlat.match(
-    /(Estimated value|Geschatte waarde).{0,160}(€\s?[\d.,]+)\s?[-–]\s?(€\s?[\d.,]+)/i
+    /(Estimated value|Geschatte waarde).{0,200}(€\s?[\d.,]+)\s?[-–]\s?(€\s?[\d.,]+)/i
   );
   const estimate = estimateMatch
     ? {
@@ -261,17 +278,21 @@ function bestEffortParse($) {
       }
     : { currency: null, low: null, high: null, text: null };
 
-  // Shipping (robust-ish)
-  const shippingParsed = extractShippingFromText(bodyTextRaw);
-  const shipping = { currency: shippingParsed.currency, costs: shippingParsed.costs };
+  // Shipping (improved)
+  const shippingParsed = extractShippingBestEffort(html, bodyTextRaw);
+  const shipping = {
+    currency: shippingParsed.currency,
+    costs: shippingParsed.costs,
+  };
 
-  // Images (filtered)
+  // Images
   const image_urls = extractImages($);
 
+  // Warnings
   const warnings = [];
   if (shipping.costs.length === 0) {
     warnings.push(
-      "Shipping costs not confidently detected; ask user for screenshot of shipping costs section."
+      "Shipping costs not confidently detected; ask user for screenshot of shipping section."
     );
   }
   if (shippingParsed.warning) warnings.push(shippingParsed.warning);
@@ -279,7 +300,7 @@ function bestEffortParse($) {
     warnings.push("No lot image URLs detected; ask user to upload photos.");
   }
 
-  return {
+  const result = {
     title,
     subtitle,
     description_text,
@@ -292,6 +313,14 @@ function bestEffortParse($) {
     image_urls,
     warnings,
   };
+
+  if (DEBUG) {
+    result.debug = {
+      shipping_candidates: shippingParsed.debug_candidates || [],
+    };
+  }
+
+  return result;
 }
 
 // =====================
@@ -312,7 +341,7 @@ app.post("/v1/catawiki/lot", async (req, res) => {
     const r = await fetch(url, {
       redirect: "follow",
       headers: {
-        "user-agent": "Mozilla/5.0 (compatible; LotReader/1.1)",
+        "user-agent": "Mozilla/5.0 (compatible; LotReader/1.2)",
         accept: "text/html,application/xhtml+xml",
       },
     });
@@ -325,7 +354,7 @@ app.post("/v1/catawiki/lot", async (req, res) => {
 
     const html = await r.text();
     const $ = cheerio.load(html);
-    const parsed = bestEffortParse($);
+    const parsed = bestEffortParse($, html);
 
     return res.json({
       ok: true,
